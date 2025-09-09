@@ -241,30 +241,48 @@ class DSPyLLMService(LLMService):
         # If a tool was requested and tools are allowed, emit function-call frames
         if self._allow_tools and tool_call:
             try:
+                # Normalize tool_call from stringified JSON → dict
+                if isinstance(tool_call, str):
+                    try:
+                        maybe = json.loads(tool_call)
+                        if isinstance(maybe, dict):
+                            tool_call = maybe
+                    except Exception:
+                        pass
+
                 if isinstance(tool_call, dict):
                     name = tool_call.get("name")
                     args = tool_call.get("arguments", {}) or {}
                 elif isinstance(tool_call, str):
-                    name = tool_call
-                    args = {}
+                    # Treat bare strings like a tool name; ignore common non-values
+                    if tool_call.strip().lower() in {"none", "null", ""}:
+                        name, args = None, {}
+                    else:
+                        name, args = tool_call, {}
                 else:
                     name = getattr(tool_call, "name", None)
                     args = getattr(tool_call, "arguments", {}) or {}
 
+                # Validate name and registration; if invalid, skip tool flow and continue
                 if not name:
                     raise ValueError("tool_call missing name")
+                if isinstance(name, str) and not self.has_function(name):
+                    logger.debug(f"{self}: ignoring unknown tool_call '{name}'")
+                    name = None
 
-                tool_call_id = str(uuid.uuid4())
-                function_call = FunctionCallFromLLM(
-                    context=context,
-                    tool_call_id=tool_call_id,
-                    function_name=name,
-                    arguments=args,
-                )
-                await self.run_function_calls([function_call])
+                if name:
+                    tool_call_id = str(uuid.uuid4())
+                    function_call = FunctionCallFromLLM(
+                        context=context,
+                        tool_call_id=tool_call_id,
+                        function_name=name,
+                        arguments=args,
+                    )
+                    await self.run_function_calls([function_call])
+                    return
             except Exception as e:
                 logger.error(f"{self}: failed to emit function call: {e}")
-            return
+                # If tool handling fails, fall through to emit any response text
 
         # Otherwise emit the user-visible response text (single chunk)
         if response:
