@@ -15,6 +15,8 @@ Predict-only integration that:
 import json
 import uuid
 from typing import Any, Callable, Dict, Mapping, Optional
+import asyncio
+import re
 
 import dspy
 import httpx
@@ -78,6 +80,10 @@ class DSPyLLMService(LLMService):
         allow_tools: bool = False,
         reinvoke_after_tool: bool = True,
         params: Optional[InputParams] = None,
+        # Streaming simulation knobs (for smoother TTS):
+        simulate_streaming: bool = True,
+        stream_chunk_chars: int = 80,
+        stream_chunk_pause_ms: int = 0,
         **kwargs,
     ):
         """Initialize service and configure DSPy LM/program."""
@@ -92,6 +98,10 @@ class DSPyLLMService(LLMService):
         self._input_mapping: Callable[[OpenAILLMContext | LLMContext], Dict[str, Any]] = (
             input_mapping or self._default_input_mapping
         )
+        # Streaming simulation settings
+        self._simulate_stream = simulate_streaming
+        self._stream_chunk_chars = max(10, int(stream_chunk_chars or 80))
+        self._stream_chunk_pause_ms = max(0, int(stream_chunk_pause_ms or 0))
 
         # Configure DSPy LM
         lm_kwargs: Dict[str, Any] = {}
@@ -213,6 +223,43 @@ class DSPyLLMService(LLMService):
             logger.error(f"{self}: run_inference error: {e}")
             return None
 
+    def _chunk_text(self, text: str) -> list[str]:
+        """Split text into small chunks near punctuation/whitespace for simulated streaming."""
+        if not text:
+            return []
+        text = str(text)
+        max_len = self._stream_chunk_chars
+        if len(text) <= max_len:
+            return [text]
+        chunks: list[str] = []
+        i = 0
+        n = len(text)
+        boundaries = re.compile(r"[\.!?\n]\s|")
+        while i < n:
+            j = min(i + max_len, n)
+            # try to extend to nearest boundary ahead (within +40 chars)
+            k = min(j + 40, n)
+            cut = None
+            # search forward for a nice break
+            for idx in range(j, k):
+                ch = text[idx - 1] if idx - 1 < n else None
+                if ch in ".!?\n":
+                    cut = idx
+                    break
+            if cut is None:
+                # fallback: search backward for whitespace
+                for idx in range(j, i, -1):
+                    if text[idx - 1].isspace():
+                        cut = idx
+                        break
+            if cut is None:
+                cut = j
+            chunk = text[i:cut].strip()
+            if chunk:
+                chunks.append(chunk)
+            i = cut
+        return chunks
+
     @traced_llm
     async def _process_predict(self, context: OpenAILLMContext | LLMContext):
         # Map context → signature inputs
@@ -284,9 +331,16 @@ class DSPyLLMService(LLMService):
                 logger.error(f"{self}: failed to emit function call: {e}")
                 # If tool handling fails, fall through to emit any response text
 
-        # Otherwise emit the user-visible response text (single chunk)
+        # Otherwise emit the user-visible response text (streamed or single chunk)
         if response:
-            await self.push_frame(LLMTextFrame(str(response)))
+            text = str(response)
+            if self._simulate_stream:
+                for chunk in self._chunk_text(text):
+                    await self.push_frame(LLMTextFrame(chunk))
+                    if self._stream_chunk_pause_ms:
+                        await asyncio.sleep(self._stream_chunk_pause_ms / 1000.0)
+            else:
+                await self.push_frame(LLMTextFrame(text))
 
     @traced_llm
     async def _process_context(self, context: OpenAILLMContext | LLMContext):
