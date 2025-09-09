@@ -241,8 +241,19 @@ class DSPyLLMService(LLMService):
         # If a tool was requested and tools are allowed, emit function-call frames
         if self._allow_tools and tool_call:
             try:
-                name = tool_call.get("name") if isinstance(tool_call, dict) else getattr(tool_call, "name")
-                args = tool_call.get("arguments", {}) if isinstance(tool_call, dict) else getattr(tool_call, "arguments", {})
+                if isinstance(tool_call, dict):
+                    name = tool_call.get("name")
+                    args = tool_call.get("arguments", {}) or {}
+                elif isinstance(tool_call, str):
+                    name = tool_call
+                    args = {}
+                else:
+                    name = getattr(tool_call, "name", None)
+                    args = getattr(tool_call, "arguments", {}) or {}
+
+                if not name:
+                    raise ValueError("tool_call missing name")
+
                 tool_call_id = str(uuid.uuid4())
                 function_call = FunctionCallFromLLM(
                     context=context,
