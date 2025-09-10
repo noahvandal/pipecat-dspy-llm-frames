@@ -69,6 +69,22 @@ class DSPyLLMService(LLMService):
         seed: Optional[int] = None
         extra: Optional[Dict[str, Any]] = None
 
+    class ContextPolicy(BaseModel):
+        """Controls which context the input mapper composes each turn.
+
+        Toggled via LLMUpdateSettingsFrame settings under keys:
+          - dspy.profile: str
+          - dspy.context_policy.*: fields below
+        """
+
+        include_system: bool = True
+        history_last_n: int = 0            # how many recent user/assistant turns to include
+        include_tool_results: bool = True  # include role=="tool" contents
+        include_summary: bool = False      # if present as tool/system blocks, include
+        include_memory: bool = False       # if present as tool/system blocks, include
+        max_context_tokens: Optional[int] = None  # reserved; not enforced here
+        compose_mode: str = "prepend"     # prepend context before question
+
     def __init__(
         self,
         *,
@@ -84,6 +100,9 @@ class DSPyLLMService(LLMService):
         simulate_streaming: bool = True,
         stream_chunk_chars: int = 80,
         stream_chunk_pause_ms: int = 0,
+        # Which DSPy output fields to expose as Pipecat frames.
+        # route ∈ {"downstream","upstream","both","downstream_skip_tts"}
+        expose_outputs: Optional[Dict[str, str]] = None,
         **kwargs,
     ):
         """Initialize service and configure DSPy LM/program."""
@@ -102,6 +121,18 @@ class DSPyLLMService(LLMService):
         self._simulate_stream = simulate_streaming
         self._stream_chunk_chars = max(10, int(stream_chunk_chars or 80))
         self._stream_chunk_pause_ms = max(0, int(stream_chunk_pause_ms or 0))
+
+        # Context policy and profile
+        self._policy = DSPyLLMService.ContextPolicy()
+        self._profile: Optional[str] = None
+        # Exposed outputs configuration (which non-response fields to surface)
+        self._expose_outputs: Dict[str, str] = {"response": "downstream"}
+        if isinstance(expose_outputs, dict):
+            for k, v in expose_outputs.items():
+                if isinstance(k, str) and isinstance(v, str):
+                    self._expose_outputs[k] = v
+        # Signature input overrides (runtime injections)
+        self._sig_input_overrides: Dict[str, Any] = {}
 
         # Configure DSPy LM
         lm_kwargs: Dict[str, Any] = {}
@@ -167,9 +198,12 @@ class DSPyLLMService(LLMService):
         return sig
 
     def _default_input_mapping(self, context: OpenAILLMContext | LLMContext) -> Dict[str, Any]:
-        """Map OpenAI-style messages to a basic Predict signature.
+        """Compose inputs per policy using OpenAI-style messages.
 
-        Default: last user message → question
+        Returns a single input key by default: "user_input" containing the
+        composed prompt (system/history/tool context + last user text). If the
+        signature does not accept "user_input", the caller will transparently
+        fall back to "question".
         """
         try:
             if isinstance(context, OpenAILLMContext):
@@ -180,33 +214,86 @@ class DSPyLLMService(LLMService):
         except Exception:
             messages = []
 
-        question = ""
-        tool_contexts: list[str] = []
+        # Extract last user utterance
+        last_user = ""
         for m in reversed(messages or []):
             if m.get("role") == "user":
                 content = m.get("content")
                 if isinstance(content, list):
                     texts = [c.get("text", "") for c in content if c.get("type") == "text"]
-                    question = " ".join([t for t in texts if t])
+                    last_user = " ".join([t for t in texts if t])
                 else:
-                    question = content or ""
+                    last_user = content or ""
                 break
-        # Collect any tool results present in context and append as inline context
-        for m in messages or []:
-            if m.get("role") == "tool":
-                c = m.get("content")
-                if isinstance(c, (dict, list)):
-                    try:
-                        c = json.dumps(c)
-                    except Exception:
-                        c = str(c)
-                if c:
-                    tool_contexts.append(str(c))
-        if tool_contexts:
-            question = (question or "").strip()
-            tool_blob = "\n\nContext from tools:\n" + "\n".join(tool_contexts)
-            question = (question + tool_blob) if question else tool_blob
-        return {"question": question}
+
+        # Build context blob as per policy
+        policy = self._policy
+        parts: list[str] = []
+
+        if policy.include_system:
+            sys_txt = next((m.get("content", "") for m in messages or [] if m.get("role") == "system"), "")
+            if sys_txt:
+                parts.append(str(sys_txt).strip())
+
+        if policy.history_last_n and policy.history_last_n > 0:
+            # Pull last N turns of user/assistant (excluding tools)
+            hist: list[str] = []
+            count = 0
+            for m in reversed([mm for mm in messages or [] if mm.get("role") in {"user", "assistant"}]):
+                role = m.get("role")
+                content = m.get("content")
+                if isinstance(content, list):
+                    text = " ".join(c.get("text", "") for c in content if c.get("type") == "text").strip()
+                else:
+                    text = str(content or "").strip()
+                if not text:
+                    continue
+                hist.append(("User:" if role == "user" else "Assistant:") + " " + text)
+                # Count only user/assistant pairs approximately
+                count += 1
+                if count >= policy.history_last_n * 2:
+                    break
+            if hist:
+                parts.append("Recent conversation:\n" + "\n".join(reversed(hist)))
+
+        if policy.include_tool_results:
+            tool_ctx: list[str] = []
+            for m in messages or []:
+                if m.get("role") == "tool":
+                    c = m.get("content")
+                    if isinstance(c, (dict, list)):
+                        try:
+                            c = json.dumps(c)
+                        except Exception:
+                            c = str(c)
+                    if c:
+                        tool_ctx.append(str(c))
+            if tool_ctx:
+                parts.append("Context from tools:\n" + "\n".join(tool_ctx))
+
+        context_blob = "\n\n".join([p for p in parts if p])
+
+        # Compose final user_input
+        if context_blob:
+            if policy.compose_mode == "prepend":
+                composed = (context_blob + "\n\nQuestion: " + (last_user or "")).strip()
+            else:
+                composed = ((last_user or "") + "\n\n" + context_blob).strip()
+        else:
+            composed = last_user or ""
+
+        # Start with composed user_input
+        inputs: Dict[str, Any] = {"user_input": composed}
+
+        # Merge runtime signature input overrides (only known fields later)
+        if self._sig_input_overrides:
+            try:
+                for k, v in self._sig_input_overrides.items():
+                    inputs[k] = v
+            except Exception:
+                pass
+
+        return inputs
 
     async def run_inference(self, context: LLMContext | OpenAILLMContext) -> Optional[str]:
         """One-shot Predict-only inference without emitting frames.
@@ -264,6 +351,30 @@ class DSPyLLMService(LLMService):
     async def _process_predict(self, context: OpenAILLMContext | LLMContext):
         # Map context → signature inputs
         inputs = self._input_mapping(context) or {}
+        # Adapt to the active signature: prefer "user_input" if declared, else fallback to "question"
+        try:
+            declared_inputs = set()
+            sig_obj = None
+            if self._program is not None:
+                # dspy.Predict(sig) stores the signature class in .signature if available; be defensive
+                sig_obj = getattr(self._program, "signature", None) or self._signature
+            sig_cls = self._resolve_signature(sig_obj) if sig_obj is not None else None
+            # Heuristic: DSPy signatures define attributes for inputs; collect simple attribute names
+            if sig_cls is not None:
+                for name, value in getattr(sig_cls, "__dict__", {}).items():
+                    # dspy.InputField likely lives as class attributes; avoid dunder/private
+                    if not name.startswith("_") and not callable(value):
+                        declared_inputs.add(name)
+        except Exception:
+            declared_inputs = set()
+
+        if "user_input" in inputs and declared_inputs and "user_input" not in declared_inputs:
+            # Fall back to question if signature doesn't accept user_input
+            ui = inputs.pop("user_input")
+            inputs.setdefault("question", ui)
+        # Also drop any injected inputs not declared by the signature
+        if declared_inputs:
+            inputs = {k: v for k, v in inputs.items() if k in declared_inputs or k in {"question", "user_input"}}
 
         # Execute Predict program
         try:
@@ -331,16 +442,58 @@ class DSPyLLMService(LLMService):
                 logger.error(f"{self}: failed to emit function call: {e}")
                 # If tool handling fails, fall through to emit any response text
 
-        # Otherwise emit the user-visible response text (streamed or single chunk)
-        if response:
-            text = str(response)
-            if self._simulate_stream:
-                for chunk in self._chunk_text(text):
-                    await self.push_frame(LLMTextFrame(chunk))
-                    if self._stream_chunk_pause_ms:
-                        await asyncio.sleep(self._stream_chunk_pause_ms / 1000.0)
+        # Expose additional outputs as configured
+        try:
+            out_map: Dict[str, Any] = {}
+            if isinstance(outputs, dict):
+                out_map = outputs
             else:
-                await self.push_frame(LLMTextFrame(text))
+                # Build a dict view from attributes
+                out_map = {k: getattr(outputs, k) for k in self._expose_outputs.keys() if hasattr(outputs, k)}
+
+            # First, push non-response fields according to policy
+            for field, route in self._expose_outputs.items():
+                if field == "response":
+                    continue
+                if field not in out_map:
+                    continue
+                val = out_map.get(field)
+                if val is None:
+                    continue
+                text = str(val)
+                await self._emit_text_field(label=field, text=text, route=route)
+        except Exception as e:
+            logger.debug(f"{self}: expose_outputs error: {e}")
+
+        # Then, emit the user-visible response text (streamed or single chunk)
+        if response is not None and "response" in self._expose_outputs:
+            text = str(response)
+            route = self._expose_outputs.get("response", "downstream")
+            if route in {"upstream", "both"}:
+                # Send upstream copy
+                await self.push_frame(LLMTextFrame(text), FrameDirection.UPSTREAM)
+            if route in {"downstream", "both", "downstream_skip_tts"}:
+                if route == "downstream_skip_tts":
+                    prev = getattr(self, "_skip_tts", False)
+                    try:
+                        self._skip_tts = True
+                        if self._simulate_stream:
+                            for chunk in self._chunk_text(text):
+                                await self.push_frame(LLMTextFrame(chunk))
+                                if self._stream_chunk_pause_ms:
+                                    await asyncio.sleep(self._stream_chunk_pause_ms / 1000.0)
+                        else:
+                            await self.push_frame(LLMTextFrame(text))
+                    finally:
+                        self._skip_tts = prev
+                else:
+                    if self._simulate_stream:
+                        for chunk in self._chunk_text(text):
+                            await self.push_frame(LLMTextFrame(chunk))
+                            if self._stream_chunk_pause_ms:
+                                await asyncio.sleep(self._stream_chunk_pause_ms / 1000.0)
+                    else:
+                        await self.push_frame(LLMTextFrame(text))
 
     @traced_llm
     async def _process_context(self, context: OpenAILLMContext | LLMContext):
@@ -386,3 +539,120 @@ class DSPyLLMService(LLMService):
             finally:
                 await self.stop_processing_metrics()
                 await self.push_frame(LLMFullResponseEndFrame())
+
+    async def _update_settings(self, settings: Mapping[str, Any]):
+        """Handle runtime updates for DSPy context policy and profile.
+
+        Supported keys:
+          - "dspy.profile": str (e.g., "chat_minimal", "chat_history_6", "rag", "agentic_tools")
+          - "dspy.context_policy.include_system": bool
+          - "dspy.context_policy.history_last_n": int
+          - "dspy.context_policy.include_tool_results": bool
+          - "dspy.context_policy.include_summary": bool
+          - "dspy.context_policy.include_memory": bool
+          - "dspy.context_policy.max_context_tokens": int
+          - "dspy.context_policy.compose_mode": str
+        Also supports nested dict at settings["dspy"]["context_policy"].
+        """
+        try:
+            # Profile
+            profile = settings.get("dspy.profile") if isinstance(settings, dict) else None
+            if profile and isinstance(profile, str):
+                self._apply_profile(profile)
+
+            # Flattened context_policy.* keys
+            prefix = "dspy.context_policy."
+            if isinstance(settings, dict):
+                for key, val in settings.items():
+                    if isinstance(key, str) and key.startswith(prefix):
+                        field = key[len(prefix) :]
+                        if hasattr(self._policy, field):
+                            setattr(self._policy, field, val)
+
+                # Nested dict path: settings["dspy"]["context_policy"]
+                dspy_block = settings.get("dspy")
+                if isinstance(dspy_block, dict):
+                    cp = dspy_block.get("context_policy")
+                    if isinstance(cp, dict):
+                        for field, val in cp.items():
+                            if hasattr(self._policy, field):
+                                setattr(self._policy, field, val)
+                    # inputs overrides: dspy.inputs.{field}: value
+                    inputs_block = dspy_block.get("inputs")
+                    if isinstance(inputs_block, dict):
+                        for field, val in inputs_block.items():
+                            self._sig_input_overrides[field] = val
+
+            # Flattened inputs: dspy.inputs.*
+            prefix_inputs = "dspy.inputs."
+            if isinstance(settings, dict):
+                for key, val in settings.items():
+                    if isinstance(key, str) and key.startswith(prefix_inputs):
+                        field = key[len(prefix_inputs) :]
+                        self._sig_input_overrides[field] = val
+
+            # Expose outputs updates: dspy.expose_outputs (mapping), dspy.hide_outputs (list)
+            if isinstance(settings, dict):
+                eo = settings.get("dspy.expose_outputs")
+                if isinstance(eo, dict):
+                    for k, v in eo.items():
+                        if isinstance(k, str) and isinstance(v, str):
+                            self._expose_outputs[k] = v
+                ho = settings.get("dspy.hide_outputs")
+                if isinstance(ho, (list, tuple)):
+                    for k in ho:
+                        if isinstance(k, str) and k in self._expose_outputs:
+                            del self._expose_outputs[k]
+        except Exception as e:
+            logger.warning(f"{self}: _update_settings ignored due to error: {e}")
+
+    def _apply_profile(self, name: str):
+        name = (name or "").strip().lower()
+        self._profile = name
+        p = DSPyLLMService.ContextPolicy()
+        if name == "chat_minimal":
+            p.include_system = True
+            p.history_last_n = 0
+            p.include_tool_results = False
+        elif name.startswith("chat_history_"):
+            # chat_history_6 → history_last_n=6
+            try:
+                k = int(name.split("_")[-1])
+            except Exception:
+                k = 6
+            p.include_system = True
+            p.history_last_n = k
+            p.include_tool_results = True
+        elif name == "rag":
+            p.include_system = True
+            p.history_last_n = 4
+            p.include_tool_results = True
+            p.include_summary = True
+        elif name == "agentic_tools":
+            p.include_system = True
+            p.history_last_n = 4
+            p.include_tool_results = True
+        self._policy = p
+
+    async def _emit_text_field(self, *, label: str, text: str, route: str):
+        if not text:
+            return
+        # Log the field explicitly so it shows up in Pipecat logs regardless of routing
+        try:
+            preview = text if len(text) <= 500 else (text[:500] + "…")
+            logger.info(f"{self}: expose_output {label} -> {route}: {preview}")
+        except Exception:
+            pass
+        msg = f"[{label}] {text}"
+        if route in {"upstream", "both"}:
+            await self.push_frame(LLMTextFrame(msg), FrameDirection.UPSTREAM)
+        if route in {"downstream", "both", "downstream_skip_tts"}:
+            if route == "downstream_skip_tts":
+                prev = getattr(self, "_skip_tts", False)
+                try:
+                    self._skip_tts = True
+                    await self.push_frame(LLMTextFrame(msg))
+                finally:
+                    self._skip_tts = prev
+            else:
+                await self.push_frame(LLMTextFrame(msg))
