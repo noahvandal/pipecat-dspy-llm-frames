@@ -672,13 +672,35 @@ class DSPyLLMService(LLMService):
                 eo = settings.get("dspy.expose_outputs")
                 if isinstance(eo, dict):
                     for k, v in eo.items():
-                        if isinstance(k, str) and isinstance(v, str):
-                            self._expose_outputs[k] = v
+                        if not isinstance(k, str):
+                            continue
+                        # Accept multiple forms:
+                        # - string route (downstream/upstream/both/downstream_skip_tts/log_only/visible/logs/debug)
+                        # - boolean True => log_only, False => hide
+                        if isinstance(v, bool):
+                            if v:
+                                self._expose_outputs[k] = "log_only"
+                            else:
+                                if k in self._expose_outputs:
+                                    del self._expose_outputs[k]
+                            continue
+                        if isinstance(v, str):
+                            route = v.strip().lower()
+                            if route in {"visible", "visibility", "log", "logs", "debug"}:
+                                route = "log_only"
+                            self._expose_outputs[k] = route
                 ho = settings.get("dspy.hide_outputs")
                 if isinstance(ho, (list, tuple)):
                     for k in ho:
                         if isinstance(k, str) and k in self._expose_outputs:
                             del self._expose_outputs[k]
+
+                # visible_outputs: list of fields to log only (do not emit frames)
+                vo = settings.get("dspy.visible_outputs")
+                if isinstance(vo, (list, tuple)):
+                    for k in vo:
+                        if isinstance(k, str):
+                            self._expose_outputs[k] = "log_only"
 
                 # Debug logging toggles
                 dbg = settings.get("dspy.debug")
@@ -730,6 +752,9 @@ class DSPyLLMService(LLMService):
         except Exception:
             pass
         msg = f"[{label}] {text}"
+        # New: log_only route to avoid injecting frames into the pipeline entirely
+        if route == "log_only":
+            return
         if route in {"upstream", "both"}:
             await self.push_frame(LLMTextFrame(msg), FrameDirection.UPSTREAM)
         if route in {"downstream", "both", "downstream_skip_tts"}:
