@@ -101,6 +101,8 @@ class DSPyLLMService(LLMService):
         simulate_streaming: bool = True,
         stream_chunk_chars: int = 80,
         stream_chunk_pause_ms: int = 0,
+        # Which output field should be treated as the primary spoken output
+        primary_output_field: str = "response",
         # Which DSPy output fields to expose as Pipecat frames.
         # route ∈ {"downstream","upstream","both","downstream_skip_tts"}
         expose_outputs: Optional[Dict[str, str]] = None,
@@ -126,6 +128,8 @@ class DSPyLLMService(LLMService):
         # Context policy and profile
         self._policy = DSPyLLMService.ContextPolicy()
         self._profile: Optional[str] = None
+        # Primary spoken output field (default: response)
+        self._primary_output_field: str = (primary_output_field or "response").strip()
         # Exposed outputs configuration (which non-response fields to surface)
         self._expose_outputs: Dict[str, str] = {"response": "downstream"}
         if isinstance(expose_outputs, dict):
@@ -443,15 +447,18 @@ class DSPyLLMService(LLMService):
             logger.error(f"{self}: DSPy execution error: {e}")
             return
 
-        # Extract response and optional tool decision
+        # Extract outputs and optional tool decision
         response = None
+        reasoning = None
         tool_call = None
         try:
             if isinstance(outputs, dict):
                 response = outputs.get("response")
+                reasoning = outputs.get("reasoning")
                 tool_call = outputs.get("tool_call")
             else:
                 response = getattr(outputs, "response", None)
+                reasoning = getattr(outputs, "reasoning", None)
                 tool_call = getattr(outputs, "tool_call", None)
         except Exception:
             pass
@@ -533,12 +540,12 @@ class DSPyLLMService(LLMService):
         except Exception as e:
             logger.debug(f"{self}: expose_outputs error: {e}")
 
-        # Then, emit the user-visible response text (streamed or single chunk)
-        if response is not None and "response" in self._expose_outputs:
-            # Only speak the assistant's response; if model returned JSON,
-            # extract the 'response' field.
-            text = self._extract_response_text(response)
-            route = self._expose_outputs.get("response", "downstream")
+        # Select the primary output to speak: use configured field (default 'response'),
+        # with explicit support for choosing 'reasoning' as the primary field.
+        primary_value = reasoning if self._primary_output_field == "reasoning" else response
+        if primary_value is not None and self._primary_output_field in self._expose_outputs:
+            text = self._extract_response_text(primary_value)
+            route = self._expose_outputs.get(self._primary_output_field, "downstream")
             if route in {"upstream", "both"}:
                 # Send upstream copy
                 await self.push_frame(LLMTextFrame(text), FrameDirection.UPSTREAM)
