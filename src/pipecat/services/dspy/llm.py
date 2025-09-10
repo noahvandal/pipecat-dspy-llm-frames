@@ -376,6 +376,15 @@ class DSPyLLMService(LLMService):
         if declared_inputs:
             inputs = {k: v for k, v in inputs.items() if k in declared_inputs or k in {"question", "user_input"}}
 
+        # Merge runtime signature input overrides even when using a custom input_mapping
+        if self._sig_input_overrides:
+            try:
+                for k, v in self._sig_input_overrides.items():
+                    if not declared_inputs or k in declared_inputs:
+                        inputs.setdefault(k, v)
+            except Exception:
+                pass
+
         # Execute Predict program
         try:
             outputs = self._program(**inputs)
