@@ -362,6 +362,37 @@ class DSPyLLMService(LLMService):
             i = cut
         return chunks
 
+    def _extract_response_text(self, response: Any) -> str:
+        """Ensure only the 'response' field is spoken if the model returned JSON.
+
+        If the response string looks like JSON containing keys like 'response',
+        extract and return that value. Otherwise, return the raw response string.
+        """
+        try:
+            if response is None:
+                return ""
+            text = str(response)
+            s = text.strip()
+            if not s:
+                return text
+            if s[0] in "[{":
+                try:
+                    data = json.loads(s)
+                    if isinstance(data, dict) and "response" in data:
+                        return str(data.get("response") or "")
+                    if (
+                        isinstance(data, list)
+                        and len(data) > 0
+                        and isinstance(data[0], dict)
+                        and "response" in data[0]
+                    ):
+                        return str(data[0].get("response") or "")
+                except Exception:
+                    pass
+            return text
+        except Exception:
+            return "" if response is None else str(response)
+
     @traced_llm
     async def _process_predict(self, context: OpenAILLMContext | LLMContext):
         # Map context → signature inputs
@@ -504,7 +535,9 @@ class DSPyLLMService(LLMService):
 
         # Then, emit the user-visible response text (streamed or single chunk)
         if response is not None and "response" in self._expose_outputs:
-            text = str(response)
+            # Only speak the assistant's response; if model returned JSON,
+            # extract the 'response' field.
+            text = self._extract_response_text(response)
             route = self._expose_outputs.get("response", "downstream")
             if route in {"upstream", "both"}:
                 # Send upstream copy
