@@ -520,6 +520,14 @@ class DSPyLLMService(LLMService):
             frame: The frame to process.
             direction: The direction of frame processing.
         """
+        # Handle DSPy-specific settings updates BEFORE delegating to base class.
+        # This prevents base handlers from logging unknown-setting warnings and
+        # ensures runtime overrides (e.g., dspy.inputs.*) take effect prior to
+        # the next inference trigger.
+        if isinstance(frame, LLMUpdateSettingsFrame):
+            await self._update_settings(frame.settings)
+            return
+
         await super().process_frame(frame, direction)
 
         context = None
@@ -533,8 +541,6 @@ class DSPyLLMService(LLMService):
             # NOTE: LLMMessagesFrame is deprecated, so we don't support the newer universal
             # LLMContext with it
             context = OpenAILLMContext.from_messages(frame.messages)
-        elif isinstance(frame, LLMUpdateSettingsFrame):
-            await self._update_settings(frame.settings)
         else:
             await self.push_frame(frame, direction)
 
