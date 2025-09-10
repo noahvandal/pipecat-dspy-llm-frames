@@ -366,36 +366,36 @@ class DSPyLLMService(LLMService):
             i = cut
         return chunks
 
-    def _extract_response_text(self, response: Any) -> str:
-        """Ensure only the 'response' field is spoken if the model returned JSON.
+    def _extract_primary_text(self, value: Any, field_name: str) -> str:
+        """Extract primary field text from a JSON string if present.
 
-        If the response string looks like JSON containing keys like 'response',
-        extract and return that value. Otherwise, return the raw response string.
+        If the provided value looks like JSON and contains the given field_name,
+        extract and return it. Otherwise, return the raw string form.
         """
         try:
-            if response is None:
+            if value is None:
                 return ""
-            text = str(response)
+            text = str(value)
             s = text.strip()
             if not s:
                 return text
             if s[0] in "[{":
                 try:
                     data = json.loads(s)
-                    if isinstance(data, dict) and "response" in data:
-                        return str(data.get("response") or "")
+                    if isinstance(data, dict) and field_name in data:
+                        return str(data.get(field_name) or "")
                     if (
                         isinstance(data, list)
                         and len(data) > 0
                         and isinstance(data[0], dict)
-                        and "response" in data[0]
+                        and field_name in data[0]
                     ):
-                        return str(data[0].get("response") or "")
+                        return str(data[0].get(field_name) or "")
                 except Exception:
                     pass
             return text
         except Exception:
-            return "" if response is None else str(response)
+            return "" if value is None else str(value)
 
     @traced_llm
     async def _process_predict(self, context: OpenAILLMContext | LLMContext):
@@ -544,7 +544,7 @@ class DSPyLLMService(LLMService):
         # with explicit support for choosing 'reasoning' as the primary field.
         primary_value = reasoning if self._primary_output_field == "reasoning" else response
         if primary_value is not None and self._primary_output_field in self._expose_outputs:
-            text = self._extract_response_text(primary_value)
+            text = self._extract_primary_text(primary_value, self._primary_output_field)
             route = self._expose_outputs.get(self._primary_output_field, "downstream")
             if route in {"upstream", "both"}:
                 # Send upstream copy
