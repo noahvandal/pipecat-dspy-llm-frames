@@ -406,37 +406,15 @@ class DSPyLLMService(LLMService):
                 logger.info(f"{self}: inputs keys -> {list(inputs.keys())}")
             except Exception:
                 pass
-        # Adapt to the active signature: prefer "user_input" if declared, else fallback to "question"
-        try:
-            declared_inputs = set()
-            sig_obj = None
-            if self._program is not None:
-                # dspy.Predict(sig) stores the signature class in .signature if available; be defensive
-                sig_obj = getattr(self._program, "signature", None) or self._signature
-            sig_cls = self._resolve_signature(sig_obj) if sig_obj is not None else None
-            # Heuristic: DSPy signatures define attributes for inputs; collect simple attribute names
-            if sig_cls is not None:
-                for name, value in getattr(sig_cls, "__dict__", {}).items():
-                    # dspy.InputField likely lives as class attributes; avoid dunder/private
-                    if not name.startswith("_") and not callable(value):
-                        declared_inputs.add(name)
-        except Exception:
-            declared_inputs = set()
-
-        if "user_input" in inputs and declared_inputs and "user_input" not in declared_inputs:
-            # Fall back to question if signature doesn't accept user_input
-            ui = inputs.pop("user_input")
-            inputs.setdefault("question", ui)
-        # Also drop any injected inputs not declared by the signature
-        if declared_inputs:
-            inputs = {k: v for k, v in inputs.items() if k in declared_inputs or k in {"question", "user_input"}}
+        # Do not rename or drop user_input. Always pass user_input (and any optional
+        # signature inputs like context_compression) through to DSPy unchanged.
+        # Some providers may add extra keys via overrides; pass them through as well.
 
         # Merge runtime signature input overrides even when using a custom input_mapping
         if self._sig_input_overrides:
             try:
                 for k, v in self._sig_input_overrides.items():
-                    if not declared_inputs or k in declared_inputs:
-                        inputs.setdefault(k, v)
+                    inputs.setdefault(k, v)
             except Exception:
                 pass
 
