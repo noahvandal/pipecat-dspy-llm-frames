@@ -134,6 +134,10 @@ class DSPyLLMService(LLMService):
         # Signature input overrides (runtime injections)
         self._sig_input_overrides: Dict[str, Any] = {}
 
+        # Debug logging controls (runtime-togglable via dspy.debug.* settings)
+        self._debug_log_inputs: bool = False
+        self._debug_log_outputs: bool = False
+
         # Configure DSPy LM
         lm_kwargs: Dict[str, Any] = {}
         if self._params.temperature is not None:
@@ -351,6 +355,11 @@ class DSPyLLMService(LLMService):
     async def _process_predict(self, context: OpenAILLMContext | LLMContext):
         # Map context → signature inputs
         inputs = self._input_mapping(context) or {}
+        if self._debug_log_inputs:
+            try:
+                logger.info(f"{self}: inputs keys -> {list(inputs.keys())}")
+            except Exception:
+                pass
         # Adapt to the active signature: prefer "user_input" if declared, else fallback to "question"
         try:
             declared_inputs = set()
@@ -459,6 +468,14 @@ class DSPyLLMService(LLMService):
             else:
                 # Build a dict view from attributes
                 out_map = {k: getattr(outputs, k) for k in self._expose_outputs.keys() if hasattr(outputs, k)}
+
+            if self._debug_log_outputs:
+                try:
+                    logger.info(f"{self}: outputs keys -> {list(out_map.keys())}")
+                    if "reasoning" in self._expose_outputs and "reasoning" not in out_map:
+                        logger.info(f"{self}: reasoning not present in outputs (nothing to expose)")
+                except Exception:
+                    pass
 
             # First, push non-response fields according to policy
             for field, route in self._expose_outputs.items():
@@ -618,6 +635,16 @@ class DSPyLLMService(LLMService):
                     for k in ho:
                         if isinstance(k, str) and k in self._expose_outputs:
                             del self._expose_outputs[k]
+
+                # Debug logging toggles
+                dbg = settings.get("dspy.debug")
+                if isinstance(dbg, dict):
+                    li = dbg.get("log_inputs")
+                    lo = dbg.get("log_outputs")
+                    if isinstance(li, bool):
+                        self._debug_log_inputs = li
+                    if isinstance(lo, bool):
+                        self._debug_log_outputs = lo
         except Exception as e:
             logger.warning(f"{self}: _update_settings ignored due to error: {e}")
 
