@@ -13,6 +13,7 @@ Predict-only integration that:
 """
 
 import json
+import os
 import uuid
 from typing import Any, Callable, Dict, Mapping, Optional
 import asyncio
@@ -137,6 +138,16 @@ class DSPyLLMService(LLMService):
         # Debug logging controls (runtime-togglable via dspy.debug.* settings)
         self._debug_log_inputs: bool = False
         self._debug_log_outputs: bool = False
+        # Also allow enabling via environment for early startup visibility
+        try:
+            env_li = os.getenv("DSPY_DEBUG_LOG_INPUTS", "").strip().lower()
+            env_lo = os.getenv("DSPY_DEBUG_LOG_OUTPUTS", "").strip().lower()
+            if env_li in {"1", "true", "yes", "on"}:
+                self._debug_log_inputs = True
+            if env_lo in {"1", "true", "yes", "on"}:
+                self._debug_log_outputs = True
+        except Exception:
+            pass
 
         # Configure DSPy LM
         lm_kwargs: Dict[str, Any] = {}
